@@ -40,9 +40,10 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::mem::size_of_val;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::vec;
 
+use datafusion::catalog::default_table_source::provider_as_source;
 use datafusion::catalog::{TableProvider, TableProviderFactory};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::datasource::empty::EmptyTable;
@@ -78,9 +79,8 @@ use datafusion_common::{
     TableReference, internal_datafusion_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_execution::TaskContext;
-use datafusion_expr::dml::CopyTo;
 use datafusion_expr::dml::{
-    MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
+    CopyTo, InsertOp, MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
 };
 use datafusion_expr::expr::{
     self, Between, BinaryExpr, Case, Cast, GroupingSet, InList, LambdaVariable, Like,
@@ -114,7 +114,8 @@ use datafusion_proto::logical_plan::file_formats::{
 };
 use datafusion_proto::logical_plan::to_proto::serialize_expr;
 use datafusion_proto::logical_plan::{
-    DefaultLogicalExtensionCodec, LogicalExtensionCodec, from_proto,
+    DecodeTableProviderArgs, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
+    TableProviderUsage, from_proto,
 };
 use datafusion_proto::protobuf;
 
@@ -189,7 +190,7 @@ pub struct TestTableProto {
     pub table_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TestTableProviderCodec {}
 
 impl LogicalExtensionCodec for TestTableProviderCodec {
@@ -260,6 +261,117 @@ async fn roundtrip_custom_tables() -> Result<()> {
     let logical_round_trip =
         logical_plan_from_bytes_with_extension_codec(&bytes, &ctx.task_ctx(), &codec)?;
     assert_eq!(format!("{scan:?}"), format!("{logical_round_trip:?}"));
+    Ok(())
+}
+
+/// Wraps [`TestTableProviderCodec`] and records the [`TableProviderUsage`] of
+/// every provider it decodes, keyed by table name.
+#[derive(Debug, Default)]
+struct UsageRecordingCodec {
+    inner: TestTableProviderCodec,
+    seen: Mutex<Vec<(String, TableProviderUsage)>>,
+}
+
+impl UsageRecordingCodec {
+    fn seen(&self) -> Vec<(String, TableProviderUsage)> {
+        self.seen.lock().expect("usage log poisoned").clone()
+    }
+}
+
+impl LogicalExtensionCodec for UsageRecordingCodec {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[LogicalPlan],
+        ctx: &TaskContext,
+    ) -> Result<Extension> {
+        self.inner.try_decode(buf, inputs, ctx)
+    }
+
+    fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> Result<()> {
+        self.inner.try_encode(node, buf)
+    }
+
+    fn try_decode_table_provider(
+        &self,
+        _buf: &[u8],
+        table_ref: &TableReference,
+        _schema: SchemaRef,
+        _ctx: &TaskContext,
+    ) -> Result<Arc<dyn TableProvider>> {
+        // DataFusion always calls `try_decode_table_provider_with_args`, so
+        // reaching this method means the usage was dropped on the way in.
+        panic!("legacy try_decode_table_provider called for {table_ref}")
+    }
+
+    fn try_decode_table_provider_with_args(
+        &self,
+        args: DecodeTableProviderArgs<'_>,
+        ctx: &TaskContext,
+    ) -> Result<Arc<dyn TableProvider>> {
+        self.seen
+            .lock()
+            .expect("usage log poisoned")
+            .push((args.table_ref().to_string(), args.usage()));
+        self.inner.try_decode_table_provider(
+            args.buf(),
+            args.table_ref(),
+            args.schema(),
+            ctx,
+        )
+    }
+
+    fn try_encode_table_provider(
+        &self,
+        table_ref: &TableReference,
+        node: Arc<dyn TableProvider>,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.inner.try_encode_table_provider(table_ref, node, buf)
+    }
+}
+
+/// A DML target is serialized as a synthetic `TableScan`, so without the usage
+/// a codec cannot tell it apart from a table that is genuinely being read. This
+/// plan reads and writes the same custom table, so a correct implementation
+/// reports both usages for the same table name.
+#[tokio::test]
+async fn roundtrip_custom_table_write_target() -> Result<()> {
+    let mut table_factories: HashMap<String, Arc<dyn TableProviderFactory>> =
+        HashMap::new();
+    table_factories.insert("TESTTABLE".to_string(), Arc::new(TestTableFactory {}));
+    let mut state = SessionStateBuilder::new().with_default_features().build();
+    *state.table_factories_mut() = table_factories;
+    let ctx = SessionContext::new_with_state(state);
+
+    let sql = "CREATE EXTERNAL TABLE t (a INT) STORED AS testtable LOCATION 's3://bucket/schema/table';";
+    ctx.sql(sql).await?;
+
+    let scan = ctx.table("t").await?.into_optimized_plan()?;
+    let target = ctx.table_provider("t").await?;
+    let plan = LogicalPlan::Dml(DmlStatement::new(
+        TableReference::bare("t"),
+        provider_as_source(target),
+        WriteOp::Insert(InsertOp::Append),
+        Arc::new(scan),
+    ));
+
+    let codec = UsageRecordingCodec::default();
+    let bytes = logical_plan_to_bytes_with_extension_codec(&plan, &codec)?;
+    let logical_round_trip =
+        logical_plan_from_bytes_with_extension_codec(&bytes, &ctx.task_ctx(), &codec)?;
+    assert_eq!(format!("{plan:?}"), format!("{logical_round_trip:?}"));
+
+    let mut seen = codec.seen();
+    seen.sort_by_key(|(_, usage)| u8::from(*usage));
+    assert_eq!(
+        seen,
+        vec![
+            ("t".to_owned(), TableProviderUsage::Scan),
+            ("t".to_owned(), TableProviderUsage::WriteTarget),
+        ]
+    );
+
     Ok(())
 }
 

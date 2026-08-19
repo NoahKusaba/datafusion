@@ -30,7 +30,8 @@ use datafusion_expr::{
     WindowUDF, WindowUDFImpl,
 };
 use datafusion_proto::logical_plan::{
-    DefaultLogicalExtensionCodec, LogicalExtensionCodec,
+    DecodeTableProviderArgs, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
+    TableProviderUsage,
 };
 
 use stabby::slice::Slice as SSlice;
@@ -52,11 +53,17 @@ use crate::{df_result, sresult_return};
 #[derive(Debug)]
 pub struct FFI_LogicalExtensionCodec {
     /// Decode bytes into a table provider.
+    ///
+    /// `usage` is a [`TableProviderUsage`] discriminant. It is sent as a `u8`
+    /// rather than as the enum so that a value from a peer built against a
+    /// newer DataFusion is a decode error on receipt rather than an invalid
+    /// discriminant, which would be undefined behavior.
     try_decode_table_provider: unsafe extern "C" fn(
         &Self,
         buf: SSlice<u8>,
         table_ref: SStr,
         schema: WrappedSchema,
+        usage: u8,
     ) -> FFI_Result<FFI_TableProvider>,
 
     /// Encode a table provider into bytes.
@@ -149,19 +156,19 @@ unsafe extern "C" fn try_decode_table_provider_fn_wrapper(
     buf: SSlice<u8>,
     table_ref: SStr,
     schema: WrappedSchema,
+    usage: u8,
 ) -> FFI_Result<FFI_TableProvider> {
+    let usage = sresult_return!(TableProviderUsage::try_from(usage));
     let ctx = sresult_return!(codec.task_ctx());
     let runtime = codec.runtime().clone();
     let codec_inner = codec.inner();
     let table_ref = TableReference::from(table_ref.as_str());
     let schema: SchemaRef = schema.into();
 
-    let table_provider = sresult_return!(codec_inner.try_decode_table_provider(
-        buf.as_ref(),
-        &table_ref,
-        schema,
-        ctx.as_ref()
-    ));
+    let args = DecodeTableProviderArgs::new(buf.as_ref(), &table_ref, schema, usage);
+    let table_provider = sresult_return!(
+        codec_inner.try_decode_table_provider_with_args(args, ctx.as_ref())
+    );
 
     FFI_Result::Ok(FFI_TableProvider::new_with_ffi_codec(
         table_provider,
@@ -361,6 +368,39 @@ impl Clone for FFI_LogicalExtensionCodec {
     }
 }
 
+impl ForeignLogicalExtensionCodec {
+    /// Cross the FFI boundary to decode a table provider.
+    ///
+    /// Shared by [`LogicalExtensionCodec::try_decode_table_provider`] and
+    /// [`LogicalExtensionCodec::try_decode_table_provider_with_args`]. The
+    /// former has nowhere to carry a usage, so it sends
+    /// [`TableProviderUsage::Scan`]; it therefore cannot describe a write
+    /// target, and a caller that needs one must use the latter. DataFusion
+    /// itself always does.
+    fn decode_table_provider(
+        &self,
+        buf: &[u8],
+        table_ref: &TableReference,
+        schema: SchemaRef,
+        usage: TableProviderUsage,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let table_ref = table_ref.to_string();
+        let schema: WrappedSchema = schema.into();
+
+        let ffi_table_provider = unsafe {
+            df_result!((self.0.try_decode_table_provider)(
+                &self.0,
+                buf.into(),
+                table_ref.as_str().into(),
+                schema,
+                usage.into()
+            ))
+        }?;
+
+        Ok((&ffi_table_provider).into())
+    }
+}
+
 impl LogicalExtensionCodec for ForeignLogicalExtensionCodec {
     fn try_decode(
         &self,
@@ -382,19 +422,20 @@ impl LogicalExtensionCodec for ForeignLogicalExtensionCodec {
         schema: SchemaRef,
         _ctx: &TaskContext,
     ) -> Result<Arc<dyn TableProvider>> {
-        let table_ref = table_ref.to_string();
-        let schema: WrappedSchema = schema.into();
+        self.decode_table_provider(buf, table_ref, schema, TableProviderUsage::Scan)
+    }
 
-        let ffi_table_provider = unsafe {
-            df_result!((self.0.try_decode_table_provider)(
-                &self.0,
-                buf.into(),
-                table_ref.as_str().into(),
-                schema
-            ))
-        }?;
-
-        Ok((&ffi_table_provider).into())
+    fn try_decode_table_provider_with_args(
+        &self,
+        args: DecodeTableProviderArgs<'_>,
+        _ctx: &TaskContext,
+    ) -> Result<Arc<dyn TableProvider>> {
+        self.decode_table_provider(
+            args.buf(),
+            args.table_ref(),
+            args.schema(),
+            args.usage(),
+        )
     }
 
     fn try_encode_table_provider(
@@ -504,7 +545,9 @@ mod tests {
     use datafusion_functions::math::abs::AbsFunc;
     use datafusion_functions_aggregate::sum::Sum;
     use datafusion_functions_window::rank::{Rank, RankType};
-    use datafusion_proto::logical_plan::LogicalExtensionCodec;
+    use datafusion_proto::logical_plan::{
+        DecodeTableProviderArgs, LogicalExtensionCodec, TableProviderUsage,
+    };
     use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 
     use crate::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
@@ -632,12 +675,15 @@ mod tests {
         let mut bytes = Vec::new();
         foreign_codec.try_encode_table_provider(&"my_table".into(), table, &mut bytes)?;
 
-        let returned_table = foreign_codec.try_decode_table_provider(
+        let table_ref = TableReference::from("my_table");
+        let args = DecodeTableProviderArgs::new(
             &bytes,
-            &"my_table".into(),
+            &table_ref,
             create_test_table().schema(),
-            ctx.task_ctx().as_ref(),
-        )?;
+            TableProviderUsage::Scan,
+        );
+        let returned_table = foreign_codec
+            .try_decode_table_provider_with_args(args, ctx.task_ctx().as_ref())?;
 
         assert!(returned_table.is::<MemTable>());
 

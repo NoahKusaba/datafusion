@@ -40,8 +40,8 @@ use datafusion_common::format::{
     ExplainAnalyzeCategories, ExplainFormat, MetricCategory, MetricType,
 };
 use datafusion_common::{
-    NullEquality, Result, TableReference, assert_or_internal_err, context,
-    internal_datafusion_err, internal_err, not_impl_err, plan_err,
+    DataFusionError, NullEquality, Result, TableReference, assert_or_internal_err,
+    context, internal_datafusion_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_datasource::file_format::FileFormat;
 use datafusion_datasource::file_format::{
@@ -136,6 +136,126 @@ macro_rules! dispatch_logical_plan {
     };
 }
 
+/// Describes how a [`TableProvider`] decoded by a [`LogicalExtensionCodec`] is
+/// used by the plan it belongs to.
+///
+/// A DML write target is serialized as a synthetic [`LogicalPlan::TableScan`],
+/// so on its own the encoded form gives a codec no way to tell the target of an
+/// `INSERT` from a table that is genuinely being read. Codecs that want to build
+/// a different provider for the two cases — for example a cheap read-only
+/// provider pinned to a snapshot for scans, and a catalog-backed provider
+/// supporting `insert_into` for write targets — can branch on
+/// [`DecodeTableProviderArgs::usage`].
+///
+/// Note that `UPDATE` and `DELETE` resolve the table once and use it both as
+/// the scanned input and as the DML target, so a codec sees the same
+/// `table_ref` twice for such a plan: once as [`Self::Scan`] and once as
+/// [`Self::WriteTarget`].
+///
+/// This enum is `non_exhaustive`: DataFusion may describe further usages in a
+/// future release, so codecs must handle values they do not recognize.
+///
+/// The discriminants are stable and `repr(u8)`, so a value can be sent over an
+/// ABI boundary as a `u8` and recovered with [`TryFrom`]. Do not transmute —
+/// an unrecognized discriminant is an error, not undefined behavior.
+#[non_exhaustive]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableProviderUsage {
+    /// The provider is the source of a [`LogicalPlan::TableScan`] and will only
+    /// be read from.
+    Scan = 0,
+    /// The provider is the target of a [`LogicalPlan::Dml`] statement and will
+    /// be written to.
+    ///
+    /// This covers every [`WriteOp`], not just `INSERT`: `UPDATE`, `DELETE` and
+    /// `TRUNCATE` targets are all reported this way.
+    ///
+    /// [`WriteOp`]: datafusion_expr::dml::WriteOp
+    WriteTarget = 1,
+}
+
+impl From<TableProviderUsage> for u8 {
+    fn from(usage: TableProviderUsage) -> Self {
+        usage as u8
+    }
+}
+
+impl TryFrom<u8> for TableProviderUsage {
+    type Error = DataFusionError;
+
+    /// Recover a usage from the discriminant produced by `u8::from`.
+    ///
+    /// Returns an error rather than a [`TableProviderUsage`] for an
+    /// unrecognized value, which is how a peer built against a newer DataFusion
+    /// appears across an ABI boundary.
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Scan),
+            1 => Ok(Self::WriteTarget),
+            other => not_impl_err!("unknown TableProviderUsage discriminant {other}"),
+        }
+    }
+}
+
+/// Arguments for
+/// [`LogicalExtensionCodec::try_decode_table_provider_with_args`].
+#[derive(Debug)]
+pub struct DecodeTableProviderArgs<'a> {
+    buf: &'a [u8],
+    table_ref: &'a TableReference,
+    schema: SchemaRef,
+    usage: TableProviderUsage,
+}
+
+impl<'a> DecodeTableProviderArgs<'a> {
+    /// # Arguments
+    /// * `buf` - the bytes written by
+    ///   [`LogicalExtensionCodec::try_encode_table_provider`]
+    /// * `table_ref` - the name the provider is registered under
+    /// * `schema` - the schema the provider was encoded with
+    /// * `usage` - how the plan being decoded uses the provider
+    ///
+    /// `usage` is required rather than defaulted because every decode has
+    /// exactly one correct answer, and a wrong one is silent: a write target
+    /// reported as a [`TableProviderUsage::Scan`] yields a provider that cannot
+    /// be written to, with no error to point at.
+    pub fn new(
+        buf: &'a [u8],
+        table_ref: &'a TableReference,
+        schema: SchemaRef,
+        usage: TableProviderUsage,
+    ) -> Self {
+        Self {
+            buf,
+            table_ref,
+            schema,
+            usage,
+        }
+    }
+
+    /// Get the encoded provider bytes.
+    pub fn buf(&self) -> &'a [u8] {
+        self.buf
+    }
+
+    /// Get the name the provider is registered under.
+    pub fn table_ref(&self) -> &'a TableReference {
+        self.table_ref
+    }
+
+    /// Get the schema the provider was encoded with.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Get how the plan being decoded uses the provider. See
+    /// [`TableProviderUsage`].
+    pub fn usage(&self) -> TableProviderUsage {
+        self.usage
+    }
+}
+
 pub trait LogicalExtensionCodec: Debug + Send + Sync + std::any::Any {
     fn try_decode(
         &self,
@@ -146,6 +266,11 @@ pub trait LogicalExtensionCodec: Debug + Send + Sync + std::any::Any {
 
     fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> Result<()>;
 
+    /// Decode a [`TableProvider`] previously encoded by
+    /// [`Self::try_encode_table_provider`].
+    ///
+    /// Prefer implementing [`Self::try_decode_table_provider_with_args`] if the
+    /// codec needs to know how the provider will be used.
     fn try_decode_table_provider(
         &self,
         buf: &[u8],
@@ -153,6 +278,25 @@ pub trait LogicalExtensionCodec: Debug + Send + Sync + std::any::Any {
         schema: SchemaRef,
         ctx: &TaskContext,
     ) -> Result<Arc<dyn TableProvider>>;
+
+    /// Decode a [`TableProvider`] previously encoded by
+    /// [`Self::try_encode_table_provider`], with additional context about how
+    /// the plan being decoded uses it.
+    ///
+    /// This is the method DataFusion calls. Codecs that build different
+    /// providers for reads and writes should implement it and branch on
+    /// [`DecodeTableProviderArgs::usage`]; see [`TableProviderUsage`] for why
+    /// that is not recoverable from the encoded bytes alone.
+    ///
+    /// The default implementation ignores the extra context and delegates to
+    /// [`Self::try_decode_table_provider`].
+    fn try_decode_table_provider_with_args(
+        &self,
+        args: DecodeTableProviderArgs<'_>,
+        ctx: &TaskContext,
+    ) -> Result<Arc<dyn TableProvider>> {
+        self.try_decode_table_provider(args.buf(), args.table_ref(), args.schema(), ctx)
+    }
 
     fn try_encode_table_provider(
         &self,
@@ -372,6 +516,33 @@ fn from_table_reference(
     Ok(TableReference::try_from(table_ref.clone())?)
 }
 
+/// Decodes the [`TableProvider`] carried by a [`CustomTableScanNode`].
+///
+/// Shared by the [`LogicalPlanType::CustomScan`] plan node, which is a real
+/// scan, and by [`to_table_source`], which decodes a DML target that was
+/// serialized as a synthetic scan. The schema is returned alongside the
+/// provider because the scan node needs it to resolve its projection.
+fn decode_custom_table_provider(
+    scan: &CustomTableScanNode,
+    usage: TableProviderUsage,
+    ctx: &TaskContext,
+    extension_codec: &dyn LogicalExtensionCodec,
+) -> Result<(TableReference, SchemaRef, Arc<dyn TableProvider>)> {
+    let schema: Schema = convert_required!(scan.schema)?;
+    let schema = Arc::new(schema);
+    let table_name = from_table_reference(scan.table_name.as_ref(), "CustomScan")?;
+
+    let args = DecodeTableProviderArgs::new(
+        &scan.custom_table_data,
+        &table_name,
+        Arc::clone(&schema),
+        usage,
+    );
+    let provider = extension_codec.try_decode_table_provider_with_args(args, ctx)?;
+
+    Ok((table_name, schema, provider))
+}
+
 /// Converts [LogicalPlan::TableScan] to [TableSource]
 /// method to be used to deserialize nodes
 /// serialized by [from_table_source]
@@ -380,13 +551,29 @@ fn to_table_source(
     ctx: &TaskContext,
     extension_codec: &dyn LogicalExtensionCodec,
 ) -> Result<Arc<dyn TableSource>> {
-    if let Some(node) = node {
-        match node.try_into_logical_plan(ctx, extension_codec)? {
-            LogicalPlan::TableScan(TableScan { source, .. }) => Ok(source),
-            _ => plan_err!("expected TableScan node"),
-        }
-    } else {
-        plan_err!("LogicalPlanNode should be provided")
+    let Some(node) = node else {
+        return plan_err!("LogicalPlanNode should be provided");
+    };
+
+    // A DML target is serialized as a synthetic `TableScan` (see
+    // `from_table_source`). When the target belongs to an extension codec,
+    // decode the provider here rather than via `try_into_logical_plan`, so the
+    // codec is told it is building a write target and not a real scan. Only the
+    // `TableSource` is kept, so the synthetic scan's projection and filters are
+    // irrelevant.
+    if let Some(LogicalPlanType::CustomScan(scan)) = &node.logical_plan_type {
+        let (_, _, provider) = decode_custom_table_provider(
+            scan,
+            TableProviderUsage::WriteTarget,
+            ctx,
+            extension_codec,
+        )?;
+        return Ok(provider_as_source(provider));
+    }
+
+    match node.try_into_logical_plan(ctx, extension_codec)? {
+        LogicalPlan::TableScan(TableScan { source, .. }) => Ok(source),
+        _ => plan_err!("expected TableScan node"),
     }
 }
 
@@ -702,8 +889,13 @@ impl AsLogicalPlan for LogicalPlanNode {
                 .build()
             }
             LogicalPlanType::CustomScan(scan) => {
-                let schema: Schema = convert_required!(scan.schema)?;
-                let schema = Arc::new(schema);
+                let (table_name, schema, provider) = decode_custom_table_provider(
+                    scan,
+                    TableProviderUsage::Scan,
+                    ctx,
+                    extension_codec,
+                )?;
+
                 let mut projection = None;
                 if let Some(columns) = &scan.projection {
                     let column_indices = columns
@@ -716,16 +908,6 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                 let filters =
                     from_proto::parse_exprs(&scan.filters, ctx, extension_codec)?;
-
-                let table_name =
-                    from_table_reference(scan.table_name.as_ref(), "CustomScan")?;
-
-                let provider = extension_codec.try_decode_table_provider(
-                    &scan.custom_table_data,
-                    &table_name,
-                    schema,
-                    ctx,
-                )?;
 
                 LogicalPlanBuilder::scan_with_filters(
                     table_name,
@@ -2233,5 +2415,30 @@ impl AsLogicalPlan for LogicalPlanNode {
                 })
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_provider_usage_u8_roundtrip() -> Result<()> {
+        for usage in [TableProviderUsage::Scan, TableProviderUsage::WriteTarget] {
+            assert_eq!(TableProviderUsage::try_from(u8::from(usage))?, usage);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn table_provider_usage_rejects_unknown_discriminant() {
+        // How a peer built against a newer DataFusion appears across an ABI
+        // boundary. This must be an error, never an invalid discriminant.
+        let err = TableProviderUsage::try_from(2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown TableProviderUsage discriminant 2"),
+            "unexpected error: {err}"
+        );
     }
 }
